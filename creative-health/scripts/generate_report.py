@@ -86,10 +86,38 @@ def load_csv(path):
                 "video_p75": safe_float(row.get("video_p75")),
                 "video_p100": safe_float(row.get("video_p100")),
                 "video_duration": safe_float(row.get("video_duration_sec")),
+                "reach": safe_float(row.get("reach")),
+                "frequency": safe_float(row.get("frequency")),
+                "headline": row.get("headline", ""),
+                "primary_text": row.get("primary_text", ""),
             }
             if ad["spend"] > 0:
                 ads.append(ad)
     return ads
+
+
+def load_daily_frequency(path):
+    """Load daily frequency JSON if it exists."""
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def load_account_frequency(path):
+    """Load account-level period frequency JSON."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def load_gemini_analysis(path):
+    """Load Gemini deep mode analysis JSON if it exists."""
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        return json.load(f)
 
 
 # ============================================================
@@ -219,27 +247,44 @@ def run_analysis(ads, primary_metric="cpa", metric_target=0):
         # Primary metric per ad
         ad["cpa"] = ad["spend"] / ad["purchases"] if ad["purchases"] > 0 else 0
 
-    # Winner classification
-    spends = sorted([a["spend"] for a in ads])
-    median_spend = spends[len(spends) // 2] if spends else 0
-    winner_threshold = median_spend * 10
+    # Classification threshold — based on media buying logic
+    # An ad needs enough spend to have generated 3 purchases at actual CPA
+    # OR 5× target CPA — whichever is higher. Below this = insufficient data.
+    classification_threshold = max(overall_cpa * 3, metric_target * 5) if metric_target > 0 else overall_cpa * 3
+    classification_threshold = max(classification_threshold, 50)  # Absolute floor
+
+    # Classification always uses blended account performance as benchmark
+    # Target CPA/ROAS is shown as a reference line, not for classification
     for ad in ads:
-        if ad["spend"] >= winner_threshold and ad["purchases"] > 0:
-            ad["tier"] = "Winner"
-        elif ad["purchases"] > 0:
-            ad["tier"] = "Mid"
-        else:
+        if ad["spend"] < classification_threshold:
+            ad["tier"] = "Insufficient Data"
+        elif ad["purchases"] == 0:
             ad["tier"] = "Loser"
+        elif primary_metric == "cpa":
+            if ad["cpa"] <= overall_cpa:
+                ad["tier"] = "Winner"
+            elif ad["cpa"] <= overall_cpa * 1.5:
+                ad["tier"] = "Mid"
+            else:
+                ad["tier"] = "Loser"
+        else:  # ROAS
+            if ad["roas"] >= overall_roas:
+                ad["tier"] = "Winner"
+            elif ad["roas"] >= overall_roas * 0.5:
+                ad["tier"] = "Mid"
+            else:
+                ad["tier"] = "Loser"
 
     winners = [a for a in ads if a["tier"] == "Winner"]
     mids = [a for a in ads if a["tier"] == "Mid"]
     losers = [a for a in ads if a["tier"] == "Loser"]
+    insufficient = [a for a in ads if a["tier"] == "Insufficient Data"]
+    classified_ads = [a for a in ads if a["tier"] != "Insufficient Data"]
 
-    # Creative volume — meaningful spend threshold
-    # Threshold = 1% of total spend or £20, whichever is higher
-    spend_threshold = max(20, total_spend * 0.01)
-    ads_above_threshold = [a for a in ads if a["spend"] >= spend_threshold]
-    ads_below_threshold = [a for a in ads if a["spend"] < spend_threshold]
+    # Creative volume — meaningful spend threshold (same as classification)
+    spend_threshold = classification_threshold
+    ads_above_threshold = classified_ads
+    ads_below_threshold = insufficient
     top5_spend = sum(a["spend"] for a in sorted(ads, key=lambda x: -x["spend"])[:5])
     top10_spend = sum(a["spend"] for a in sorted(ads, key=lambda x: -x["spend"])[:10])
 
@@ -261,6 +306,13 @@ def run_analysis(ads, primary_metric="cpa", metric_target=0):
     dead_weight = sorted([a for a in ads if a["spend"] > 5 and a["purchases"] == 0], key=lambda x: -x["spend"])
     dead_weight_spend = sum(a["spend"] for a in dead_weight)
 
+    # Frequency analysis
+    ads_with_freq = [a for a in ads if a.get("frequency", 0) > 0]
+    avg_frequency = sum(a["frequency"] for a in ads_with_freq) / len(ads_with_freq) if ads_with_freq else 0
+    # Fatigue flags: high frequency + high spend
+    fatigue_threshold = 4.0
+    fatigued_ads = sorted([a for a in ads if a.get("frequency", 0) >= fatigue_threshold and a["spend"] >= spend_threshold], key=lambda x: -x["frequency"])
+
     # Cross-dimensional: Angle x Funnel
     cross_af = defaultdict(lambda: defaultdict(lambda: {"spend": 0, "purchases": 0, "revenue": 0}))
     for ad in parseable:
@@ -279,13 +331,52 @@ def run_analysis(ads, primary_metric="cpa", metric_target=0):
         g["revenue"] += ad["purchase_value"]
         g["count"] += 1
 
-    # ============ RECALIBRATED SCORING ============
-    # Funnel Balance (10%) — penalty starts at 40% (not 50%)
+    # Frequency analysis
+    for ad in ads:
+        ad["frequency"] = ad["impressions"] / (ad["impressions"] / ad["cpm"] * 1000) if ad["cpm"] > 0 and ad["impressions"] > 0 else 0
+        # Simplified: frequency ≈ impressions / reach. We don't have reach directly,
+        # so we flag high-frequency based on CPM trends. Will be enhanced when frequency
+        # is pulled directly from API.
+
+    # Offer detection — check if ad is offer-based
+    offer_keywords = ["offer", "off", "discount", "promo", "sale", "price", "deal", "free"]
+    for ad in ads:
+        name_lower = ad["name"].lower() + " " + ad["adset"].lower()
+        ad["is_offer"] = any(kw in name_lower for kw in offer_keywords)
+    offer_ads = [a for a in classified_ads if a["is_offer"]]
+    non_offer_ads = [a for a in classified_ads if not a["is_offer"]]
+    offer_pct = (len(offer_ads) / len(classified_ads) * 100) if classified_ads else 0
+
+    # Video length buckets
+    video_buckets = {"0-15s": [], "15-30s": [], "30-45s": [], "45-60s": [], "1min+": []}
+    for ad in video_ads:
+        dur = ad["video_duration"]
+        if dur <= 0:
+            continue
+        elif dur <= 15:
+            video_buckets["0-15s"].append(ad)
+        elif dur <= 30:
+            video_buckets["15-30s"].append(ad)
+        elif dur <= 45:
+            video_buckets["30-45s"].append(ad)
+        elif dur <= 60:
+            video_buckets["45-60s"].append(ad)
+        else:
+            video_buckets["1min+"].append(ad)
+
+    # Hit rates — two variants
+    # 1. Classified hit rate: winners / (winners + mids + losers) — excludes insufficient data
+    # 2. Account hit rate: winners / all ads — includes insufficient data
+    hit_rate_classified = (len(winners) / len(classified_ads) * 100) if classified_ads else 0
+    hit_rate_account = (len(winners) / len(ads) * 100) if ads else 0
+
+    # ============ SCORING ============
+    # Funnel Balance (15%) — penalty starts at 40%
     funnel_shares = [g["spend_pct"] for _, g in dim_funnel["groups"]]
     max_funnel = max(funnel_shares) if funnel_shares else 100
     funnel_score = max(0, min(100, 100 - max(0, (max_funnel - 40)) * 1.67))
 
-    # Angle Diversity (10%) — HHI based
+    # Angle Diversity (15%) — HHI based
     angle_score = max(0, min(100, 100 - (dim_angle["hhi"] - 500) / 40))
 
     # Media Type Diversity (10%) — penalty starts at 35%
@@ -293,43 +384,31 @@ def run_analysis(ads, primary_metric="cpa", metric_target=0):
     max_media = max(media_shares) if media_shares else 100
     media_score = max(0, min(100, 100 - max(0, (max_media - 35)) * 1.54))
 
-    # Winner Hit Rate (15%) — logarithmic, harder to max
-    hit_rate = (len(winners) / len(ads) * 100) if ads else 0
-    hit_rate_score = min(100, 40 * math.log(1 + hit_rate) / math.log(1 + 8)) if hit_rate > 0 else 0
-    # Rescale: 8% → ~40, 15% → ~62, 25% → ~78
+    # Winner Hit Rate (25%) — logarithmic, uses classified hit rate
+    hit_rate_score = min(100, 40 * math.log(1 + hit_rate_classified) / math.log(1 + 8)) if hit_rate_classified > 0 else 0
     hit_rate_score = min(100, hit_rate_score * 2.5)
 
-    # Spend on Winners (15%) — logarithmic
+    # Spend on Winners (20%)
     winner_spend = sum(a["spend"] for a in winners)
     winner_spend_pct = (winner_spend / total_spend * 100) if total_spend > 0 else 0
     spend_winner_score = min(100, (winner_spend_pct / 60) * 100)
 
-    # Hold Rate (10%) — keep, but flag as approximate
-    hold_score = min(100, (avg_hold / 25) * 100) if video_ads else 50
-
-    # Naming Compliance (10%)
-    compliance_score = compliance_rate
-
     # Creative Volume (10%) — scale by account spend tier
     weeks = 4.3
-    ads_per_week = len(ads_above_threshold) / weeks  # Only count meaningful ads
-    # Benchmark by spend tier: <£5k/mo=3/wk, £5-15k=5/wk, £15-50k=8/wk, >£50k=12/wk
-    monthly_spend = total_spend  # This is already the period spend
+    monthly_spend = total_spend
     if monthly_spend < 5000: vol_bench = 3
     elif monthly_spend < 15000: vol_bench = 5
     elif monthly_spend < 50000: vol_bench = 8
     else: vol_bench = 12
-    volume_score = min(100, (ads_per_week / vol_bench) * 100)
+    volume_score = min(100, (len(classified_ads) / weeks / vol_bench) * 100)
 
-    # Composite — removed thumbstop until metric is fixed
+    # Composite (6 sub-scores, 100% total)
     composite = round(
-        funnel_score * 0.12 +
-        angle_score * 0.12 +
-        media_score * 0.12 +
-        hit_rate_score * 0.18 +
-        spend_winner_score * 0.18 +
-        hold_score * 0.08 +
-        compliance_score * 0.10 +
+        funnel_score * 0.15 +
+        angle_score * 0.15 +
+        media_score * 0.10 +
+        hit_rate_score * 0.25 +
+        spend_winner_score * 0.25 +
         volume_score * 0.10
     )
 
@@ -337,24 +416,28 @@ def run_analysis(ads, primary_metric="cpa", metric_target=0):
         "ads": ads, "total_spend": total_spend, "total_purchases": total_purchases,
         "total_revenue": total_revenue, "overall_roas": overall_roas, "overall_cpa": overall_cpa,
         "primary_metric": primary_metric, "metric_target": metric_target,
-        "winners": winners, "mids": mids, "losers": losers,
-        "winner_threshold": winner_threshold, "hit_rate": hit_rate,
+        "winners": winners, "mids": mids, "losers": losers, "insufficient": insufficient,
+        "classified_ads": classified_ads,
+        "classification_threshold": classification_threshold,
+        "hit_rate_classified": hit_rate_classified, "hit_rate_account": hit_rate_account,
         "winner_spend": winner_spend, "winner_spend_pct": winner_spend_pct,
         "spend_threshold": spend_threshold,
         "ads_above_threshold": ads_above_threshold, "ads_below_threshold": ads_below_threshold,
+        "offer_ads": offer_ads, "non_offer_ads": non_offer_ads, "offer_pct": offer_pct,
+        "video_buckets": video_buckets,
         "top5_spend": top5_spend, "top10_spend": top10_spend,
         "parseable": parseable, "unparseable": unparseable, "compliance_rate": compliance_rate,
         "dim_funnel": dim_funnel, "dim_angle": dim_angle, "dim_media": dim_media,
         "video_ads": video_ads, "avg_thumbstop": avg_thumbstop, "avg_hold": avg_hold,
         "video_spend": video_spend, "video_roas": video_roas, "video_cpa": video_cpa,
         "dead_weight": dead_weight, "dead_weight_spend": dead_weight_spend,
+        "avg_frequency": avg_frequency, "fatigued_ads": fatigued_ads,
         "cross_af": cross_af, "identity_groups": identity_groups,
         "composite": composite,
         "sub_scores": {
             "funnel_balance": round(funnel_score, 1), "angle_diversity": round(angle_score, 1),
             "media_diversity": round(media_score, 1), "hit_rate": round(hit_rate_score, 1),
             "spend_on_winners": round(spend_winner_score, 1),
-            "hold_rate": round(hold_score, 1), "compliance": round(compliance_score, 1),
             "volume": round(volume_score, 1),
         },
     }
@@ -408,6 +491,138 @@ def tier_badge(tier):
     return f'<span class="badge" style="background:{colors.get(tier,"#94a3b8")};color:white">{tier}</span>'
 
 
+def generate_frequency_section(a):
+    """Generate frequency & fatigue HTML section with daily chart."""
+    daily = a.get("daily_frequency", [])
+    fatigued = a.get("fatigued_ads", [])
+    avg_f = a.get("avg_frequency", 0)
+
+    freq_color = "#ef4444" if avg_f >= 4 else "#f59e0b" if avg_f >= 2.5 else "#10b981"
+
+    html = f'''<div class="card">
+        <div class="card-header"><span class="card-icon">🔄</span><h3>Frequency & Fatigue</h3></div>
+        <div class="video-summary">
+            <div class="metric-box"><div class="metric-value" style="color:{freq_color}">{avg_f:.2f}</div><div class="metric-label">Avg Account Frequency</div><div class="metric-bench">{"⚠️ High — creative fatigue risk" if avg_f >= 3.5 else "Healthy" if avg_f < 2.5 else "Monitor"}</div></div>
+            <div class="metric-box"><div class="metric-value" style="color:{"#ef4444" if len(fatigued) > 0 else "#10b981"}">{len(fatigued)}</div><div class="metric-label">Fatigued Ads</div><div class="metric-bench">Frequency ≥ 4.0 with meaningful spend</div></div>
+        </div>'''
+
+    # Daily frequency chart
+    if daily:
+        labels = json.dumps([d["date"][-5:] for d in daily])  # MM-DD format
+        freq_data = json.dumps([d["frequency"] for d in daily])
+        cpm_data = json.dumps([d["cpm"] for d in daily])
+        html += f'''
+        <h4>30-Day Frequency Trend</h4>
+        <div style="height:250px;margin-bottom:20px"><canvas id="freqChart"></canvas></div>
+        <script>
+        new Chart(document.getElementById("freqChart"), {{
+            type: "line",
+            data: {{
+                labels: {labels},
+                datasets: [
+                    {{ label: "Frequency", data: {freq_data}, borderColor: "#3b82f6", backgroundColor: "rgba(59,130,246,0.1)", fill: true, tension: 0.3, yAxisID: "y" }},
+                    {{ label: "CPM (£)", data: {cpm_data}, borderColor: "#f59e0b", borderDash: [5,5], tension: 0.3, yAxisID: "y1" }}
+                ]
+            }},
+            options: {{
+                responsive: true, maintainAspectRatio: false,
+                plugins: {{ legend: {{ position: "top" }} }},
+                scales: {{
+                    y: {{ position: "left", title: {{ display: true, text: "Frequency" }}, min: 0 }},
+                    y1: {{ position: "right", title: {{ display: true, text: "CPM (£)" }}, grid: {{ drawOnChartArea: false }} }}
+                }}
+            }}
+        }});
+        </script>'''
+
+    # Fatigued ads table
+    if fatigued:
+        html += '<h4>Ads Showing Fatigue Signals</h4><table class="data-table"><thead><tr><th>Ad</th><th>Frequency</th><th>Spend</th><th>CTR</th><th>CPA</th></tr></thead><tbody>'
+        for fa in fatigued[:8]:
+            ns = fa["name"][:55] + "..." if len(fa["name"]) > 55 else fa["name"]
+            cpa = fmt_cpa(fa.get("cpa", 0))
+            html += f'<tr><td class="name-cell">{ns}</td><td style="color:#ef4444"><strong>{fa["frequency"]:.1f}</strong></td><td>{fmt_money(fa["spend"])}</td><td>{fa["ctr"]:.2f}%</td><td>{cpa}</td></tr>'
+        html += '</tbody></table>'
+    elif avg_f < 3:
+        html += '<p class="muted">No ads showing fatigue signals. Frequency is healthy across the account.</p>'
+
+    html += '<div class="interpretation" id="interp-frequency"><details><summary class="interp-toggle">Data Interpretation</summary><div class="interp-content"><!-- INTERPRETATION:frequency --></div></details></div></div>'
+    return html
+
+
+def generate_hooks_section(gemini_data):
+    """Generate hooks & headlines performance table from Gemini deep mode data."""
+    if not gemini_data:
+        return ""
+
+    # Sort by spend descending
+    sorted_data = sorted(gemini_data, key=lambda x: -x.get("spend", 0))
+
+    # Hook type colors
+    hook_colors = {
+        "Question": "#3b82f6", "Bold Claim": "#f59e0b", "Social Proof": "#8b5cf6",
+        "Problem Agitation": "#ef4444", "Testimonial": "#10b981", "Demonstration": "#06b6d4",
+        "Offer/Price": "#f43f5e", "Pattern Interrupt": "#ec4899", "No Hook": "#6b7280",
+    }
+
+    html = f'''<div class="card">
+        <div class="card-header"><span class="card-icon">🎯</span><h3>Hooks & Headlines Performance</h3><span class="badge">Deep Mode · {len(sorted_data)} ads analysed</span></div>
+        <div class="card-body">'''
+
+    # Hook type summary strip
+    hook_counts = {}
+    hook_spend = {}
+    for item in sorted_data:
+        ht = item.get("hook_type", "Unknown")
+        hook_counts[ht] = hook_counts.get(ht, 0) + 1
+        hook_spend[ht] = hook_spend.get(ht, 0) + item.get("spend", 0)
+
+    total_spend = sum(hook_spend.values()) or 1
+    html += '<div class="metric-strip">'
+    for ht, count in sorted(hook_counts.items(), key=lambda x: -hook_spend.get(x[0], 0)):
+        pct = hook_spend[ht] / total_spend * 100
+        color = hook_colors.get(ht, "#6b7280")
+        html += f'<div class="metric-box"><div class="metric-value" style="color:{color}">{count}</div><div class="metric-label">{ht}</div><div class="metric-bench">{pct:.0f}% of spend</div></div>'
+    html += '</div>'
+
+    # Per-ad hooks table
+    html += '<h4>Hook Text × Performance</h4>'
+    html += '<table class="data-table"><thead><tr><th>Ad</th><th>Hook Text</th><th>Type</th><th>Spend</th><th>CPA</th><th>CTR</th></tr></thead><tbody>'
+    for item in sorted_data:
+        name = item.get("ad_name", "")
+        name_short = name[:45] + "..." if len(name) > 45 else name
+        hook = item.get("hook_text", "N/A")
+        hook_short = hook[:60] + "..." if len(hook) > 60 else hook
+        ht = item.get("hook_type", "Unknown")
+        color = hook_colors.get(ht, "#6b7280")
+        spend = fmt_money(item.get("spend", 0))
+        cpa = fmt_cpa(item.get("cpa", 0))
+        ctr = f'{item.get("ctr", 0):.2f}%'
+
+        html += f'<tr><td class="name-cell" title="{name}">{name_short}</td>'
+        html += f'<td title="{hook}"><em>{hook_short}</em></td>'
+        html += f'<td><span style="color:{color};font-weight:600">{ht}</span></td>'
+        html += f'<td>{spend}</td><td>{cpa}</td><td>{ctr}</td></tr>'
+    html += '</tbody></table>'
+
+    # Headlines table (only if any differ from hook text)
+    headlines = [item for item in sorted_data if item.get("headline_text", "") not in ("", "Same as hook", "No text overlay")]
+    if headlines:
+        html += '<h4>Headline Text on Creative</h4>'
+        html += '<table class="data-table"><thead><tr><th>Ad</th><th>Headline</th><th>Spend</th><th>CPA</th></tr></thead><tbody>'
+        for item in headlines:
+            name = item.get("ad_name", "")
+            name_short = name[:45] + "..." if len(name) > 45 else name
+            headline = item.get("headline_text", "")
+            hl_short = headline[:70] + "..." if len(headline) > 70 else headline
+            html += f'<tr><td class="name-cell">{name_short}</td><td><em>{hl_short}</em></td><td>{fmt_money(item.get("spend", 0))}</td><td>{fmt_cpa(item.get("cpa", 0))}</td></tr>'
+        html += '</tbody></table>'
+
+    html += '<div class="interpretation" id="interp-hooks"><details><summary class="interp-toggle">Data Interpretation</summary><div class="interp-content"><!-- INTERPRETATION:hooks --></div></details></div>'
+    html += '</div></div>'
+    return html
+
+
 def generate_html(analysis, client_name, account_id, days):
     a = analysis
     ads = a["ads"]
@@ -432,17 +647,18 @@ def generate_html(analysis, client_name, account_id, days):
         <div class="score-label" style="color:{color}">{label}</div>
     </div>'''
 
-    # Sub-score bars
+    # Sub-score bars — weights shift when deep mode adds hook diversity
+    has_hooks = "hook_diversity" in ss
     sub_items = [
-        ("Funnel Balance", ss["funnel_balance"], 12),
-        ("Angle Diversity", ss["angle_diversity"], 12),
-        ("Media Type Diversity", ss["media_diversity"], 12),
-        ("Winner Hit Rate", ss["hit_rate"], 18),
-        ("Spend on Winners", ss["spend_on_winners"], 18),
-        ("Hold Rate", ss["hold_rate"], 8),
-        ("Naming Compliance", ss["compliance"], 10),
-        ("Creative Volume", ss["volume"], 10),
+        ("Funnel Balance", ss["funnel_balance"], 12 if has_hooks else 15),
+        ("Angle Diversity", ss["angle_diversity"], 13 if has_hooks else 15),
+        ("Media Type Diversity", ss["media_diversity"], 10),
+        ("Winner Hit Rate", ss["hit_rate"], 25),
+        ("Spend on Winners", ss["spend_on_winners"], 25),
+        ("Creative Volume", ss["volume"], 5 if has_hooks else 10),
     ]
+    if has_hooks:
+        sub_items.append(("Hook Type Diversity", ss["hook_diversity"], 10))
     sub_bars = ""
     for lbl, sc, wt in sub_items:
         c = score_color(sc)
@@ -480,8 +696,8 @@ def generate_html(analysis, client_name, account_id, days):
         <div class="volume-grid">
             <div class="metric-box"><div class="metric-value">{len(ads)}</div><div class="metric-label">Total Active Ads</div></div>
             <div class="metric-box"><div class="metric-value">{len(a["ads_above_threshold"])}</div><div class="metric-label">Above {fmt_money(a["spend_threshold"])} Spend</div><div class="metric-bench">Meaningful spend threshold</div></div>
-            <div class="metric-box"><div class="metric-value" style="color:var(--muted)">{len(a["ads_below_threshold"])}</div><div class="metric-label">Below Threshold (Noise)</div><div class="metric-bench">{fmt_money(sum(x["spend"] for x in a["ads_below_threshold"]))} total</div></div>
-            <div class="metric-box"><div class="metric-value">{len(a["ads_above_threshold"]) / 4.3:.1f}</div><div class="metric-label">Meaningful Ads / Week</div></div>
+            <div class="metric-box"><div class="metric-value" style="color:var(--muted)">{len(a["ads_below_threshold"])}</div><div class="metric-label">Below Threshold</div><div class="metric-bench">{fmt_money(sum(x["spend"] for x in a["ads_below_threshold"]))} total</div></div>
+            <div class="metric-box"><div class="metric-value">{a["offer_pct"]:.0f}%</div><div class="metric-label">Offer Ads</div><div class="metric-bench">{len(a["offer_ads"])} offer / {len(a["non_offer_ads"])} non-offer</div></div>
         </div>
         <h4>Spend Concentration</h4>
         <table class="data-table">
@@ -508,24 +724,45 @@ def generate_html(analysis, client_name, account_id, days):
             wp += f'<tr><td>{angle}</td><td>{d["count"]}</td><td>{fmt_money(d["spend"])}</td></tr>'
         wp += '</tbody></table>'
 
+    # Winner classification detail
+    if a["primary_metric"] == "cpa":
+        win_def = f'CPA ≤ {fmt_cpa(a["overall_cpa"])} (at or below blended)'
+        mid_def = f'CPA {fmt_cpa(a["overall_cpa"])}–{fmt_cpa(a["overall_cpa"]*1.5)}'
+        lose_def = f'CPA > {fmt_cpa(a["overall_cpa"]*1.5)} or 0 purchases'
+    else:
+        win_def = f'ROAS ≥ {fmt_roas(a["overall_roas"])} (at or above blended)'
+        mid_def = f'ROAS {fmt_roas(a["overall_roas"]*0.5)}–{fmt_roas(a["overall_roas"])}'
+        lose_def = f'ROAS < {fmt_roas(a["overall_roas"]*0.5)} or 0 purchases'
+
+    classified_count = len(a["classified_ads"])
     winner_html = f'''<div class="card">
         <div class="card-header"><span class="card-icon">⭐</span><h3>Winner / Mid / Loser Distribution</h3></div>
-        <p class="muted" style="margin-bottom:12px">Winner = spend ≥10× account median ({fmt_money(a["winner_threshold"])}) with ≥1 purchase.</p>
+        <p class="muted" style="margin-bottom:12px">Minimum spend to classify: <strong>{fmt_money(a["classification_threshold"])}</strong> (max of 3× blended CPA, 5× target CPA). Ads below this threshold have insufficient data to judge.</p>
         <div class="winner-grid">
-            <div class="metric-box" style="border-left:4px solid #10b981"><div class="metric-value" style="color:#10b981">{len(a["winners"])}</div><div class="metric-label">Winners ({pct(len(a["winners"]),len(ads))}%)</div><div class="metric-bench">{fmt_money(a["winner_spend"])} · {a["winner_spend_pct"]:.0f}% of spend</div></div>
-            <div class="metric-box" style="border-left:4px solid #f59e0b"><div class="metric-value" style="color:#f59e0b">{len(a["mids"])}</div><div class="metric-label">Mid ({pct(len(a["mids"]),len(ads))}%)</div><div class="metric-bench">{fmt_money(sum(x["spend"] for x in a["mids"]))}</div></div>
-            <div class="metric-box" style="border-left:4px solid #ef4444"><div class="metric-value" style="color:#ef4444">{len(a["losers"])}</div><div class="metric-label">Losers ({pct(len(a["losers"]),len(ads))}%)</div><div class="metric-bench">{fmt_money(sum(x["spend"] for x in a["losers"]))}</div></div>
+            <div class="metric-box" style="border-left:4px solid #10b981"><div class="metric-value" style="color:#10b981">{len(a["winners"])}</div><div class="metric-label">Winners ({pct(len(a["winners"]),classified_count)}%)</div><div class="metric-bench">{fmt_money(a["winner_spend"])} · {win_def}</div></div>
+            <div class="metric-box" style="border-left:4px solid #f59e0b"><div class="metric-value" style="color:#f59e0b">{len(a["mids"])}</div><div class="metric-label">Mid ({pct(len(a["mids"]),classified_count)}%)</div><div class="metric-bench">{fmt_money(sum(x["spend"] for x in a["mids"]))} · {mid_def}</div></div>
+            <div class="metric-box" style="border-left:4px solid #ef4444"><div class="metric-value" style="color:#ef4444">{len(a["losers"])}</div><div class="metric-label">Losers ({pct(len(a["losers"]),classified_count)}%)</div><div class="metric-bench">{fmt_money(sum(x["spend"] for x in a["losers"]))} · {lose_def}</div></div>
+            <div class="metric-box" style="border-left:4px solid #94a3b8"><div class="metric-value" style="color:#94a3b8">{len(a["insufficient"])}</div><div class="metric-label">Insufficient Data</div><div class="metric-bench">{fmt_money(sum(x["spend"] for x in a["insufficient"]))} · Below {fmt_money(a["classification_threshold"])} spend</div></div>
         </div>
+        <h4>Win Rate</h4>
+        <table class="data-table" style="max-width:600px">
+            <thead><tr><th>Metric</th><th>Value</th><th>Base</th></tr></thead>
+            <tbody>
+                <tr><td><strong>Classified Win Rate</strong></td><td><strong>{a["hit_rate_classified"]:.1f}%</strong></td><td>{len(a["winners"])} winners / {classified_count} classified ads (excl. insufficient data)</td></tr>
+                <tr><td>Account Win Rate</td><td>{a["hit_rate_account"]:.1f}%</td><td>{len(a["winners"])} winners / {len(ads)} total ads (incl. insufficient data)</td></tr>
+            </tbody>
+        </table>
         {wp}
         <div class="interpretation" id="interp-winners"><details><summary class="interp-toggle">Data Interpretation</summary><div class="interp-content"><!-- INTERPRETATION:winners --></div></details></div>
     </div>'''
 
     # Heatmap
+    funnel_display = {"TOF": "Problem Aware", "MOF": "Solution Aware", "BOF": "Product Aware"}
     funnels_order = ["TOF", "MOF", "BOF"]
     angles_sorted = sorted(a["cross_af"].keys(), key=lambda x: -sum(a["cross_af"][x][f]["spend"] for f in funnels_order))
     heatmap = '<div class="card"><div class="card-header"><span class="card-icon">🔥</span><h3>Angle × Funnel Heatmap</h3></div>'
     heatmap += '<table class="heatmap"><thead><tr><th>Angle</th>'
-    for f in funnels_order: heatmap += f'<th>{f}</th>'
+    for f in funnels_order: heatmap += f'<th>{funnel_display.get(f, f)}</th>'
     heatmap += f'<th>Total</th></tr></thead><tbody>'
     for angle in angles_sorted[:10]:
         heatmap += f'<tr><td class="angle-cell">{angle}</td>'
@@ -560,14 +797,35 @@ def generate_html(analysis, client_name, account_id, days):
     if a["video_ads"]:
         vid_metric = fmt_cpa(a["video_cpa"]) + " CPA" if a["primary_metric"] == "cpa" else fmt_roas(a["video_roas"]) + " ROAS"
         acct_metric = fmt_cpa(a["overall_cpa"]) if a["primary_metric"] == "cpa" else fmt_roas(a["overall_roas"])
+        vid_purchases = sum(v["purchases"] for v in a["video_ads"])
         video_html += f'''<div class="video-summary">
-            <div class="metric-box"><div class="metric-value">{a["avg_thumbstop"]:.1f}%</div><div class="metric-label">Avg Thumbstop*</div><div class="metric-bench">*video_play_actions — relative only</div></div>
-            <div class="metric-box"><div class="metric-value" style="color:{score_color(min(100, a["avg_hold"]/25*100))}">{a["avg_hold"]:.1f}%</div><div class="metric-label">Avg Hold Rate</div><div class="metric-bench">ThruPlay / 3-sec views</div></div>
             <div class="metric-box"><div class="metric-value">{len(a["video_ads"])}</div><div class="metric-label">Video Ads</div><div class="metric-bench">{pct(a["video_spend"], a["total_spend"])}% of spend</div></div>
+            <div class="metric-box"><div class="metric-value">{fmt_money(a["video_spend"])}</div><div class="metric-label">Video Spend</div></div>
+            <div class="metric-box"><div class="metric-value">{vid_purchases:.0f}</div><div class="metric-label">Video Purchases</div></div>
             <div class="metric-box"><div class="metric-value">{vid_metric}</div><div class="metric-label">Video {metric_label}</div><div class="metric-bench">vs {acct_metric} account avg</div></div>
         </div>
-        <h4>Top Videos by Spend</h4>
-        <table class="data-table"><thead><tr><th>Ad</th><th>Spend</th><th>Thumbstop*</th><th>Hold</th><th>{metric_label}</th><th>Duration</th></tr></thead><tbody>'''
+        <h4>Performance by Video Length</h4>'''
+        unknown_dur = [v for v in a["video_ads"] if v["video_duration"] <= 0]
+        if unknown_dur:
+            video_html += f'<p class="muted" style="margin-bottom:8px">⚠️ {len(unknown_dur)}/{len(a["video_ads"])} video ads have unknown duration (Meta API permission issue). Run in deep mode for Gemini-based duration detection.</p>'
+        video_html += f'''<table class="data-table"><thead><tr><th>Duration</th><th>Ads</th><th>Spend</th><th>Purchases</th><th>{metric_label}</th><th>Hold Rate</th></tr></thead><tbody>'''
+        for bucket_name in ["0-15s", "15-30s", "30-45s", "45-60s", "1min+"]:
+            bads = a["video_buckets"][bucket_name]
+            if not bads:
+                video_html += f'<tr><td>{bucket_name}</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>'
+                continue
+            bspend = sum(v["spend"] for v in bads)
+            bpurch = sum(v["purchases"] for v in bads)
+            bhold = sum(v["hold_rate"] for v in bads) / len(bads)
+            if a["primary_metric"] == "cpa":
+                bperf = fmt_cpa(bspend / bpurch) if bpurch > 0 else "—"
+            else:
+                brev = sum(v["purchase_value"] for v in bads)
+                bperf = fmt_roas(brev / bspend) if bspend > 0 else "—"
+            video_html += f'<tr><td><strong>{bucket_name}</strong></td><td>{len(bads)}</td><td>{fmt_money(bspend)}</td><td>{bpurch:.0f}</td><td>{bperf}</td><td>{bhold:.1f}%</td></tr>'
+        video_html += '</tbody></table>'
+        video_html += f'''<h4>Top Videos by Spend</h4>
+        <table class="data-table"><thead><tr><th>Ad</th><th>Spend</th><th>{metric_label}</th><th>Purchases</th><th>Hold Rate</th><th>Duration</th></tr></thead><tbody>'''
         for v in sorted(a["video_ads"], key=lambda x: -x["spend"])[:10]:
             ns = v["name"][:55] + "..." if len(v["name"]) > 55 else v["name"]
             dur = f'{v["video_duration"]:.0f}s' if v["video_duration"] > 0 else "—"
@@ -575,10 +833,10 @@ def generate_html(analysis, client_name, account_id, days):
                 perf = fmt_cpa(v["cpa"])
             else:
                 perf = fmt_roas(v["roas"])
-            video_html += f'<tr><td class="name-cell" title="{v["name"]}">{ns}</td><td>{fmt_money(v["spend"])}</td><td>{v["thumbstop_rate"]:.1f}%</td><td>{v["hold_rate"]:.1f}%</td><td>{perf}</td><td>{dur}</td></tr>'
+            video_html += f'<tr><td class="name-cell" title="{v["name"]}">{ns}</td><td>{fmt_money(v["spend"])}</td><td>{perf}</td><td>{v["purchases"]:.0f}</td><td>{v["hold_rate"]:.1f}%</td><td>{dur}</td></tr>'
         video_html += '</tbody></table>'
     else:
-        video_html += '<p class="muted">No video data available.</p>'
+        video_html += '<p class="muted">No video ads found in this period.</p>'
     video_html += f'<div class="interpretation" id="interp-video"><details><summary class="interp-toggle">Data Interpretation</summary><div class="interp-content"><!-- INTERPRETATION:video --></div></details></div></div>'
 
     # Dead weight
@@ -652,84 +910,160 @@ def generate_html(analysis, client_name, account_id, days):
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Creative Health — {client_name}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-:root {{ --bg:#f8fafc; --card:#fff; --border:#e2e8f0; --text:#1e293b; --muted:#64748b; }}
+:root {{ --bg:#fafaf9; --card:#fff; --border:#e7e5e4; --text:#1c1917; --muted:#78716c; --accent:#7c3aed; --accent-light:#f5f3ff; --accent-soft:#ede9fe; --sidebar:#1c1917; --sidebar-text:#d6d3d1; --sidebar-hover:#292524; --sidebar-active:#7c3aed; }}
 * {{ margin:0; padding:0; box-sizing:border-box; }}
-body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; background:var(--bg); color:var(--text); line-height:1.6; }}
-.container {{ max-width:1200px; margin:0 auto; padding:24px; }}
-.header {{ text-align:center; padding:40px 0 32px; }}
-.header h1 {{ font-size:28px; font-weight:700; }}
-.header .subtitle {{ color:var(--muted); font-size:14px; }}
-.kpi-strip {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:12px; margin-bottom:24px; }}
-.kpi {{ background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; text-align:center; }}
+html {{ scroll-behavior:smooth; }}
+body {{ font-family:'Inter',system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); line-height:1.6; -webkit-font-smoothing:antialiased; }}
+.layout {{ display:flex; max-width:1440px; margin:0 auto; }}
+.sidebar {{ width:240px; background:var(--sidebar); color:var(--sidebar-text); padding:28px 0; position:sticky; top:0; height:100vh; overflow-y:auto; flex-shrink:0; }}
+.sidebar-brand {{ padding:0 22px 20px; border-bottom:1px solid #292524; margin-bottom:16px; }}
+.sidebar-brand-title {{ font-size:11px; text-transform:uppercase; letter-spacing:1.5px; color:#a8a29e; font-weight:600; }}
+.sidebar-brand-name {{ font-size:15px; font-weight:700; color:#fafaf9; margin-top:4px; }}
+.sidebar nav {{ display:flex; flex-direction:column; gap:2px; padding:0 12px; }}
+.sidebar nav a {{ color:var(--sidebar-text); text-decoration:none; font-size:13px; padding:9px 12px; border-radius:8px; font-weight:500; transition:all .15s ease; display:flex; align-items:center; gap:10px; }}
+.sidebar nav a:hover {{ background:var(--sidebar-hover); color:#fafaf9; }}
+.sidebar nav a.active {{ background:var(--sidebar-active); color:white; }}
+.sidebar nav .nav-dot {{ width:6px; height:6px; border-radius:50%; background:#57534e; flex-shrink:0; }}
+.sidebar nav a:hover .nav-dot {{ background:#a8a29e; }}
+.sidebar nav a.active .nav-dot {{ background:white; }}
+.sidebar-score {{ margin-top:24px; padding:16px 22px; border-top:1px solid #292524; }}
+.sidebar-score-label {{ font-size:10px; text-transform:uppercase; letter-spacing:1.5px; color:#a8a29e; font-weight:600; }}
+.sidebar-score-value {{ font-size:36px; font-weight:800; color:#fafaf9; margin-top:4px; line-height:1; }}
+.sidebar-score-status {{ font-size:12px; color:#a8a29e; margin-top:4px; }}
+.container {{ flex:1; max-width:1180px; margin:0 auto; padding:32px 40px; min-width:0; }}
+.section-title {{ scroll-margin-top:24px; }}
+.header {{ text-align:center; padding:48px 0 36px; }}
+.header h1 {{ font-size:32px; font-weight:800; letter-spacing:-.5px; background:linear-gradient(135deg,#0f172a 0%,#334155 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }}
+.header .subtitle {{ color:var(--muted); font-size:14px; margin-top:6px; font-weight:500; }}
+.kpi-strip {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-bottom:28px; }}
+.kpi {{ background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px 16px; text-align:center; box-shadow:0 1px 3px rgba(0,0,0,.04); }}
 .kpi .kpi-value {{ font-size:22px; font-weight:700; }}
-.kpi .kpi-label {{ font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-top:2px; }}
-.score-section {{ display:flex; gap:32px; align-items:flex-start; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:28px; margin-bottom:24px; flex-wrap:wrap; }}
+.kpi .kpi-label {{ font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; margin-top:4px; font-weight:600; }}
+.score-section {{ display:flex; gap:36px; align-items:flex-start; background:var(--card); border:1px solid var(--border); border-radius:16px; padding:32px; margin-bottom:28px; flex-wrap:wrap; box-shadow:0 1px 3px rgba(0,0,0,.04); }}
 .score-ring {{ text-align:center; flex-shrink:0; }}
-.score-label {{ font-size:16px; font-weight:600; margin-top:4px; }}
+.score-label {{ font-size:15px; font-weight:700; margin-top:6px; letter-spacing:-.2px; }}
 .sub-scores {{ flex:1; min-width:300px; }}
-.sub-scores h3 {{ margin-bottom:12px; font-size:16px; }}
-.sub-score {{ display:flex; align-items:center; gap:10px; margin-bottom:8px; }}
-.sub-label {{ width:180px; font-size:13px; flex-shrink:0; }}
-.sub-label .weight {{ color:var(--muted); }}
-.sub-track {{ flex:1; height:8px; background:#e5e7eb; border-radius:4px; overflow:hidden; }}
-.sub-fill {{ height:100%; border-radius:4px; }}
-.sub-value {{ width:36px; text-align:right; font-weight:600; font-size:13px; }}
-.card {{ background:var(--card); border:1px solid var(--border); border-radius:12px; padding:24px; margin-bottom:20px; }}
-.card-header {{ display:flex; align-items:center; gap:10px; margin-bottom:16px; flex-wrap:wrap; }}
-.card-header h3 {{ font-size:17px; font-weight:600; }}
-.card-icon {{ font-size:20px; }}
-.badge {{ display:inline-block; padding:2px 10px; border-radius:20px; font-size:11px; font-weight:600; }}
-.dimension-bars {{ display:flex; flex-direction:column; gap:10px; }}
+.sub-scores h3 {{ margin-bottom:14px; font-size:15px; font-weight:700; }}
+.sub-score {{ display:flex; align-items:center; gap:10px; margin-bottom:10px; }}
+.sub-label {{ width:180px; font-size:13px; flex-shrink:0; font-weight:500; }}
+.sub-label .weight {{ color:var(--muted); font-weight:400; }}
+.sub-track {{ flex:1; height:6px; background:#e5e7eb; border-radius:3px; overflow:hidden; }}
+.sub-fill {{ height:100%; border-radius:3px; transition:width .3s ease; }}
+.sub-value {{ width:36px; text-align:right; font-weight:700; font-size:13px; }}
+.card {{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:28px; margin-bottom:20px; box-shadow:0 1px 3px rgba(0,0,0,.04); }}
+.card-header {{ display:flex; align-items:center; gap:10px; margin-bottom:18px; flex-wrap:wrap; }}
+.card-header h3 {{ font-size:16px; font-weight:700; letter-spacing:-.2px; }}
+.card-icon {{ font-size:18px; }}
+.badge {{ display:inline-block; padding:3px 12px; border-radius:20px; font-size:11px; font-weight:600; letter-spacing:.2px; }}
+.dimension-bars {{ display:flex; flex-direction:column; gap:12px; }}
 .bar-row {{ display:flex; align-items:center; gap:10px; }}
-.bar-label {{ width:140px; font-size:13px; font-weight:500; flex-shrink:0; }}
-.bar-track {{ flex:1; height:24px; background:#f1f5f9; border-radius:6px; overflow:hidden; }}
-.bar-fill {{ height:100%; border-radius:6px; display:flex; align-items:center; padding:0 8px; color:white; font-size:11px; font-weight:600; min-width:40px; }}
+.bar-label {{ width:140px; font-size:13px; font-weight:600; flex-shrink:0; }}
+.bar-track {{ flex:1; height:28px; background:#f1f5f9; border-radius:8px; overflow:hidden; }}
+.bar-fill {{ height:100%; border-radius:8px; display:flex; align-items:center; padding:0 10px; color:white; font-size:11px; font-weight:600; min-width:40px; }}
 .bar-meta {{ font-size:11px; color:var(--muted); width:240px; text-align:right; flex-shrink:0; }}
-.video-summary,.compliance-grid,.winner-grid,.volume-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:16px; margin-bottom:20px; }}
-.metric-box {{ text-align:center; padding:16px; background:#f8fafc; border-radius:8px; }}
+.video-summary,.compliance-grid,.winner-grid,.volume-grid,.metric-strip {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin-bottom:20px; }}
+.metric-box {{ text-align:center; padding:18px 14px; background:#f8fafc; border-radius:10px; border:1px solid var(--border); }}
 .metric-value {{ font-size:24px; font-weight:700; }}
-.metric-label {{ font-size:12px; color:var(--muted); margin-top:2px; }}
+.metric-label {{ font-size:11px; color:var(--muted); margin-top:4px; font-weight:500; }}
 .metric-bench {{ font-size:10px; color:var(--muted); margin-top:2px; }}
-.data-table {{ width:100%; border-collapse:collapse; font-size:12px; }}
-.data-table th {{ background:#f8fafc; padding:8px 10px; text-align:left; font-weight:600; border-bottom:2px solid var(--border); font-size:11px; text-transform:uppercase; letter-spacing:.3px; }}
-.data-table td {{ padding:8px 10px; border-bottom:1px solid var(--border); }}
-.data-table tr:hover {{ background:#f8fafc; }}
-.name-cell {{ max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:'SF Mono',monospace; font-size:11px; }}
-.heatmap {{ width:100%; border-collapse:collapse; font-size:12px; }}
-.heatmap th {{ background:#f8fafc; padding:10px; text-align:center; font-weight:600; border-bottom:2px solid var(--border); }}
-.heatmap td {{ padding:10px; text-align:center; border-bottom:1px solid var(--border); }}
-.heatmap .angle-cell {{ text-align:left; font-weight:500; }}
-.heatmap .empty-cell {{ color:#cbd5e1; }}
-.heatmap .total-cell {{ background:#f8fafc; font-weight:600; }}
-.interpretation {{ margin-top:16px; }}
-.interp-toggle {{ cursor:pointer; font-size:13px; font-weight:600; color:#3b82f6; padding:8px 0; list-style:none; }}
+.data-table {{ width:100%; border-collapse:separate; border-spacing:0; font-size:12px; }}
+.data-table th {{ background:#f8fafc; padding:10px 12px; text-align:left; font-weight:600; border-bottom:2px solid var(--border); font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); }}
+.data-table td {{ padding:10px 12px; border-bottom:1px solid #f1f5f9; }}
+.data-table tbody tr {{ transition:background .15s ease; }}
+.data-table tbody tr:hover {{ background:#f8fafc; }}
+.data-table tbody tr:last-child td {{ border-bottom:none; }}
+.name-cell {{ max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:'SF Mono','Fira Code',monospace; font-size:11px; }}
+.heatmap {{ width:100%; border-collapse:separate; border-spacing:0; font-size:12px; }}
+.heatmap th {{ background:#f8fafc; padding:10px; text-align:center; font-weight:600; border-bottom:2px solid var(--border); font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); }}
+.heatmap td {{ padding:10px; text-align:center; border-bottom:1px solid #f1f5f9; }}
+.heatmap .angle-cell {{ text-align:left; font-weight:600; }}
+.heatmap .empty-cell {{ color:#d1d5db; }}
+.heatmap .total-cell {{ background:#f8fafc; font-weight:700; }}
+.interpretation {{ margin-top:18px; }}
+.interp-toggle {{ cursor:pointer; font-size:13px; font-weight:600; color:var(--accent); padding:8px 0; list-style:none; }}
 .interp-toggle::-webkit-details-marker {{ display:none; }}
-.interp-toggle::before {{ content:"▶ "; font-size:10px; }}
-details[open] .interp-toggle::before {{ content:"▼ "; }}
-.interp-content {{ padding:16px; background:#f0f9ff; border-radius:8px; margin-top:8px; font-size:13px; line-height:1.7; }}
+.interp-toggle::before {{ content:"▸ "; font-size:12px; }}
+details[open] .interp-toggle::before {{ content:"▾ "; }}
+.interp-content {{ padding:18px 20px; background:var(--accent-light); border-radius:10px; margin-top:8px; font-size:13px; line-height:1.75; border:1px solid #dbeafe; }}
 .interp-content p {{ margin-bottom:10px; }}
 .interp-content strong {{ color:#1e40af; }}
-.iteration-card {{ background:#fefce8; border:1px solid #fde68a; border-radius:10px; padding:20px; margin-bottom:16px; }}
-.iteration-card h4 {{ font-size:14px; margin-bottom:8px; }}
-.iteration-card .script-section {{ font-size:13px; margin-bottom:6px; }}
-.iteration-card .script-label {{ font-weight:600; color:#92400e; display:inline-block; width:80px; }}
-.iteration-card .script-meta {{ display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }}
-.iteration-card .meta-tag {{ background:#fef3c7; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:500; }}
+.iteration-card {{ background:linear-gradient(135deg,#fffbeb 0%,#fef3c7 100%); border:1px solid #fde68a; border-radius:12px; padding:22px; margin-bottom:16px; }}
+.iteration-card h4 {{ font-size:14px; margin-bottom:8px; font-weight:700; }}
+.iteration-card .script-section {{ font-size:13px; margin-bottom:6px; line-height:1.6; }}
+.iteration-card .script-label {{ font-weight:700; color:#92400e; display:inline-block; width:80px; }}
+.iteration-card .script-meta {{ display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }}
+.iteration-card .meta-tag {{ background:rgba(255,255,255,.6); padding:3px 10px; border-radius:6px; font-size:11px; font-weight:600; border:1px solid #fde68a; }}
 .muted {{ color:var(--muted); }}
-h4 {{ font-size:14px; margin:16px 0 10px; }}
-.section-title {{ font-size:20px; font-weight:700; margin:32px 0 16px; padding-top:16px; border-top:2px solid var(--border); }}
+h4 {{ font-size:14px; margin:18px 0 10px; font-weight:700; letter-spacing:-.1px; }}
+.section-title {{ font-size:18px; font-weight:800; margin:36px 0 16px; padding-top:20px; border-top:1px solid var(--border); letter-spacing:-.3px; text-transform:uppercase; font-size:12px; color:var(--muted); letter-spacing:1px; }}
 .unstructured-list {{ list-style:none; padding:0; }}
-.unstructured-list li {{ padding:6px 0; border-bottom:1px solid var(--border); font-size:12px; font-family:'SF Mono',monospace; }}
-.footer {{ text-align:center; padding:32px 0; color:var(--muted); font-size:12px; }}
+.unstructured-list li {{ padding:6px 0; border-bottom:1px solid #f1f5f9; font-size:12px; font-family:'SF Mono','Fira Code',monospace; }}
+.footer {{ text-align:center; padding:40px 0; color:var(--muted); font-size:11px; font-weight:500; letter-spacing:.3px; }}
+.cover-bar {{ width:100%; height:120px; object-fit:cover; border-radius:16px 16px 0 0; display:block; }}
+.header-wrap {{ background:var(--card); border:1px solid var(--border); border-radius:16px; margin-bottom:28px; box-shadow:0 1px 3px rgba(0,0,0,.04); overflow:hidden; }}
+.header-wrap .header {{ padding:28px 32px 24px; border-radius:0; }}
+.header-actions {{ display:flex; gap:10px; justify-content:center; margin-top:14px; }}
+.btn {{ display:inline-flex; align-items:center; gap:6px; padding:8px 18px; border-radius:8px; font-size:12px; font-weight:600; text-decoration:none; cursor:pointer; border:none; transition:all .15s ease; }}
+.btn-primary {{ background:var(--accent); color:white; }}
+.btn-primary:hover {{ background:#6d28d9; }}
+.btn-outline {{ background:transparent; color:var(--text); border:1px solid var(--border); }}
+.btn-outline:hover {{ background:#f8fafc; }}
+.range-select {{ padding:8px 14px; border-radius:8px; font-size:12px; font-weight:600; border:1px solid var(--border); background:white; color:var(--text); cursor:pointer; font-family:inherit; }}
+.range-select:hover {{ background:#f8fafc; }}
+.date-range {{ display:inline-block; background:#f1f5f9; padding:4px 14px; border-radius:6px; font-size:12px; font-weight:600; color:var(--text); margin-top:8px; letter-spacing:.2px; }}
+@media (max-width:900px) {{ .sidebar {{ display:none; }} .container {{ padding:24px 16px; }} }}
 @media (max-width:768px) {{ .bar-meta {{ display:none; }} .score-section {{ flex-direction:column; align-items:center; }} }}
 </style>
 </head>
 <body>
+<div class="layout">
+<aside class="sidebar">
+    <div class="sidebar-brand">
+        <div class="sidebar-brand-title">Creative Health</div>
+        <div class="sidebar-brand-name">{(a.get("brand_icon", "") + " ") if a.get("brand_icon") else ""}{client_name}</div>
+    </div>
+    <nav>
+        <a href="#sec-volume"><span class="nav-dot"></span>Volume</a>
+        <a href="#sec-dimensions"><span class="nav-dot"></span>Dimensions</a>
+        <a href="#sec-heatmap"><span class="nav-dot"></span>Cross-Dimensional</a>
+        <a href="#sec-video"><span class="nav-dot"></span>Video</a>
+        {'<a href="#sec-hooks"><span class="nav-dot"></span>Hooks & Headlines</a>' if a.get("gemini_data") else ''}
+        <a href="#sec-identity"><span class="nav-dot"></span>Identity</a>
+        <a href="#sec-frequency"><span class="nav-dot"></span>Frequency</a>
+        <a href="#sec-efficiency"><span class="nav-dot"></span>Efficiency</a>
+        <a href="#sec-iterations"><span class="nav-dot"></span>Iterations</a>
+        <a href="#sec-ads"><span class="nav-dot"></span>Ad-Level Detail</a>
+        <a href="#sec-compliance"><span class="nav-dot"></span>Naming</a>
+    </nav>
+    <div class="sidebar-score">
+        <div class="sidebar-score-label">Health Score</div>
+        <div class="sidebar-score-value" style="color:{color}">{composite}</div>
+        <div class="sidebar-score-status">{label}</div>
+    </div>
+</aside>
 <div class="container">
-<div class="header">
-    <h1>Creative Health Report</h1>
-    <div class="subtitle">{client_name} · {account_id} · Last {days} days {("· " + target_str) if target_str else ""}</div>
+<div class="header-wrap">
+    {'<img class="cover-bar" src="' + a.get("cover_image", "") + '" alt="">' if a.get("cover_image") else ""}
+    <div class="header">
+        <h1>{(a.get("brand_icon", "") + " ") if a.get("brand_icon") else ""}{client_name}</h1>
+        <div class="subtitle">Creative Health Report · {account_id} {("· " + target_str) if target_str else ""}</div>
+        <div class="date-range">{a.get("date_start", "")} &mdash; {a.get("date_end", "") if a.get("date_start") else f"Last {days} days"}</div>
+        <div class="header-actions">
+            <select id="range-select" class="range-select">
+                <option value="7">Last 7 days</option>
+                <option value="14">Last 14 days</option>
+                <option value="30" selected>Last 30 days</option>
+                <option value="60">Last 60 days</option>
+                <option value="90">Last 90 days</option>
+            </select>
+            <button class="btn btn-primary" id="gen-btn" onclick="(()=>{{const d=document.getElementById('range-select').value;const p=`Run /creative-health on {account_id} for the last ${{d}} days. Client: {client_name}. Metric: {a['primary_metric'].upper()}. Target: {a['metric_target']}.`;navigator.clipboard.writeText(p);const b=document.getElementById('gen-btn');b.textContent='Copied — paste into Claude';setTimeout(()=>b.textContent='Generate New Report',2000)}})()">Generate New Report</button>
+            <button class="btn btn-outline" onclick="window.print()">Download PDF</button>
+        </div>
+    </div>
 </div>
 
 <div class="kpi-strip">
@@ -737,8 +1071,9 @@ h4 {{ font-size:14px; margin:16px 0 10px; }}
     <div class="kpi"><div class="kpi-value">{fmt_money(a["total_spend"])}</div><div class="kpi-label">Total Spend</div></div>
     <div class="kpi"><div class="kpi-value">{a["total_purchases"]:.0f}</div><div class="kpi-label">Purchases</div></div>
     {metric_kpi}
-    <div class="kpi"><div class="kpi-value">{a["hit_rate"]:.1f}%</div><div class="kpi-label">Hit Rate</div></div>
-    <div class="kpi"><div class="kpi-value">{len(a["video_ads"])}</div><div class="kpi-label">Video Ads</div></div>
+    <div class="kpi"><div class="kpi-value">{a["hit_rate_account"]:.1f}%</div><div class="kpi-label">Account Win Rate</div></div>
+    <div class="kpi"><div class="kpi-value">{a["hit_rate_classified"]:.1f}%</div><div class="kpi-label">Classified Win Rate</div></div>
+    <div class="kpi"><div class="kpi-value" style="color:{"#ef4444" if a["avg_frequency"] >= 4 else "#f59e0b" if a["avg_frequency"] >= 2.5 else "#10b981"}">{a["avg_frequency"]:.1f}</div><div class="kpi-label">Avg Frequency</div></div>
 </div>
 
 <div class="score-section">
@@ -749,38 +1084,69 @@ h4 {{ font-size:14px; margin:16px 0 10px; }}
     </div>
 </div>
 
-<h2 class="section-title">Creative Volume & Concentration</h2>
+<div class="card" style="background:#f8fafc">
+    <details><summary class="interp-toggle" style="color:#64748b">How is this score calculated?</summary>
+    <div class="interp-content" style="background:white">
+        <p><strong>Creative Health Score</strong> is a weighted composite of {"7" if has_hooks else "6"} sub-scores. Each measures a different dimension of creative portfolio health.{" Deep Mode adds Hook Type Diversity." if has_hooks else ""}</p>
+        <table class="data-table">
+            <thead><tr><th>Sub-score</th><th>Weight</th><th>What it measures</th><th>How it's calculated</th></tr></thead>
+            <tbody>
+                <tr><td>Funnel Balance</td><td>{"12" if has_hooks else "15"}%</td><td>Are you testing across all awareness stages?</td><td>Starts at 100, loses 1.67 pts for every % above 40% in the most dominant stage</td></tr>
+                <tr><td>Angle Diversity</td><td>{"13" if has_hooks else "15"}%</td><td>How concentrated is spend across messaging angles?</td><td>Based on HHI (see below). Lower HHI = more diverse = higher score</td></tr>
+                <tr><td>Media Diversity</td><td>10%</td><td>Is the format mix balanced or single-format heavy?</td><td>Penalises if any single format holds >35% of spend</td></tr>
+                <tr><td>Winner Hit Rate</td><td>25%</td><td>What % of classified ads are winners?</td><td>Logarithmic curve. Winner = CPA at or below blended average. Harder to max at higher rates</td></tr>
+                <tr><td>Spend on Winners</td><td>25%</td><td>Is the algorithm scaling winners, or spreading evenly?</td><td>Winner spend % / 60% benchmark. 60% on winners = full score</td></tr>
+                <tr><td>Creative Volume</td><td>{"5" if has_hooks else "10"}%</td><td>Are enough new concepts being shipped?</td><td>Classified ads/week vs spend-tier benchmark (£5-15k=5/wk, £15-50k=8/wk)</td></tr>
+                {'<tr><td>Hook Type Diversity</td><td>10%</td><td>Are you testing different hook approaches?</td><td>HHI-based. Measures spend concentration across hook types (Question, Bold Claim, Social Proof, etc.)</td></tr>' if has_hooks else ''}
+            </tbody>
+        </table>
+        <p style="margin-top:12px"><strong>HHI (Herfindahl-Hirschman Index)</strong> measures spend concentration. Square each value's spend share %, sum all squares. <strong>< 1500</strong> = diverse (green), <strong>1500-2500</strong> = moderate (amber), <strong>> 2500</strong> = concentrated (red). Example: 3 angles at 50%/30%/20% → HHI = 2500+900+400 = 3800 (concentrated).</p>
+        <p><strong>Winner classification:</strong> Ads need ≥ {fmt_money(a["classification_threshold"])} spend to be classified (max of 3× blended {metric_label}, 5× target {metric_label}). Winners = {metric_label} at or better than blended average ({fmt_cpa(a["overall_cpa"]) if a["primary_metric"] == "cpa" else fmt_roas(a["overall_roas"])}). Losers = {metric_label} worse than 1.5× blended or 0 purchases.</p>
+    </div>
+    </details>
+</div>
+
+<h2 class="section-title" id="sec-volume">Creative Volume & Concentration</h2>
 {volume_html}
 {winner_html}
 
-<h2 class="section-title">Dimension Analysis</h2>
+<h2 class="section-title" id="sec-dimensions">Dimension Analysis</h2>
 {dim_card("Funnel Stage", a["dim_funnel"], "🎯", "funnel")}
 {dim_card("Angle / Message Territory", a["dim_angle"], "💬", "angle")}
 {dim_card("Media Type", a["dim_media"], "🖼️", "media")}
 
-<h2 class="section-title">Cross-Dimensional</h2>
+<h2 class="section-title" id="sec-heatmap">Cross-Dimensional</h2>
 {heatmap}
 
-<h2 class="section-title">Video Performance</h2>
+<h2 class="section-title" id="sec-video">Video Performance</h2>
 {video_html}
 
-<h2 class="section-title">Identity Analysis</h2>
+{f'<h2 class="section-title" id="sec-hooks">Hooks & Headlines Performance</h2>' + chr(10) + generate_hooks_section(a.get("gemini_data", [])) if a.get("gemini_data") else ""}
+
+<h2 class="section-title" id="sec-identity">Identity Analysis</h2>
 {identity_html}
 
-<h2 class="section-title">Efficiency</h2>
+<h2 class="section-title" id="sec-frequency">Frequency & Creative Fatigue</h2>
+{generate_frequency_section(a)}
+
+<h2 class="section-title" id="sec-efficiency">Efficiency</h2>
 {dead_html}
 
-<h2 class="section-title">Iteration Scripts</h2>
+<h2 class="section-title" id="sec-iterations">Iteration Scripts</h2>
 {iterations_html}
 
-<h2 class="section-title">Ad-Level Detail</h2>
+<h2 class="section-title" id="sec-ads">Ad-Level Detail</h2>
 {top_html}
 
-<h2 class="section-title">Naming Compliance</h2>
+<h2 class="section-title" id="sec-compliance">Naming Compliance</h2>
 {comp_html}
 
-<div class="footer">Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} · Creative Health Report v2.0 · LWU</div>
+<div class="footer">Generated {datetime.now().strftime("%d %b %Y, %H:%M")} · LWU Creative Health v2.1{" · Deep Mode" if a.get("gemini_data") else ""}</div>
 </div>
+</div>
+<script>
+(()=>{{const links=document.querySelectorAll('.sidebar nav a');const secs=[...links].map(l=>document.querySelector(l.getAttribute('href'))).filter(Boolean);const io=new IntersectionObserver(es=>{{es.forEach(e=>{{if(e.isIntersecting){{links.forEach(l=>l.classList.remove('active'));const i=secs.indexOf(e.target);if(i>=0)links[i].classList.add('active')}}}})}},{{rootMargin:'-20% 0px -70% 0px'}});secs.forEach(s=>io.observe(s))}})();
+</script>
 </body>
 </html>'''
     return html
@@ -868,7 +1234,9 @@ def save_summary_json(analysis, output_path, client_name, account_id, days):
         "total_ads": len(a["ads"]), "total_spend": round(a["total_spend"], 2),
         "total_purchases": a["total_purchases"], "overall_roas": round(a["overall_roas"], 2),
         "overall_cpa": round(a["overall_cpa"], 2),
-        "winners": len(a["winners"]), "hit_rate": round(a["hit_rate"], 1),
+        "winners": len(a["winners"]),
+        "hit_rate_classified": round(a["hit_rate_classified"], 1),
+        "hit_rate_account": round(a["hit_rate_account"], 1),
         "winner_spend_pct": round(a["winner_spend_pct"], 1),
         "ads_above_threshold": len(a["ads_above_threshold"]),
         "ads_below_threshold": len(a["ads_below_threshold"]),
@@ -900,6 +1268,9 @@ def main():
     parser.add_argument("--days", type=int, default=30, help="Date range")
     parser.add_argument("--metric", choices=["cpa", "roas"], default="cpa", help="Primary metric")
     parser.add_argument("--target", type=float, default=0, help="Metric target (e.g., 25 for £25 CPA)")
+    parser.add_argument("--daily-freq", default="", help="Path to daily_frequency.json")
+    parser.add_argument("--cover-image", default="", help="URL for brand cover image in header")
+    parser.add_argument("--icon", default="", help="Emoji icon for the brand")
     parser.add_argument("--output", default="creative-health-report.html", help="Output HTML path")
     args = parser.parse_args()
 
@@ -907,8 +1278,106 @@ def main():
     ads = load_csv(args.input)
     print(f"Loaded {len(ads)} ads")
 
+    # Load pull metadata for date range
+    input_dir = os.path.dirname(args.input)
+    meta_path = os.path.join(input_dir, "pull_metadata.json")
+    pull_meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            pull_meta = json.load(f)
+
+    # Load frequency data
+    daily_freq = []
+    account_freq = None
+
+    if args.daily_freq and os.path.exists(args.daily_freq):
+        daily_freq = load_daily_frequency(args.daily_freq)
+    else:
+        auto_path = os.path.join(input_dir, "daily_frequency.json")
+        if os.path.exists(auto_path):
+            daily_freq = load_daily_frequency(auto_path)
+    if daily_freq:
+        print(f"Loaded {len(daily_freq)} daily frequency data points")
+
+    acct_path = os.path.join(input_dir, "account_frequency.json")
+    if os.path.exists(acct_path):
+        account_freq = load_account_frequency(acct_path)
+        print(f"Account period frequency: {account_freq.get('frequency', 0)}")
+
+    # Load Gemini deep mode data if available
+    gemini_path = os.path.join(input_dir, "gemini_analysis.json")
+    gemini_data = load_gemini_analysis(gemini_path)
+    if gemini_data:
+        print(f"Loaded Gemini deep mode data: {len(gemini_data)} ads analysed")
+        # Backfill missing video durations from Gemini analysis
+        gemini_durations = {}
+        for item in gemini_data:
+            dur = item.get("estimated_duration_sec") or item.get("video_duration_api") or 0
+            if dur > 0:
+                gemini_durations[item["ad_id"]] = float(dur)
+        if gemini_durations:
+            backfilled = 0
+            for ad in ads:
+                if ad["video_duration"] <= 0 and ad["ad_id"] in gemini_durations:
+                    ad["video_duration"] = gemini_durations[ad["ad_id"]]
+                    backfilled += 1
+            if backfilled:
+                print(f"  Backfilled {backfilled} video durations from Gemini data")
+
     print(f"Running analysis (primary metric: {args.metric.upper()}, target: {args.target})...")
     analysis = run_analysis(ads, primary_metric=args.metric, metric_target=args.target)
+    analysis["daily_frequency"] = daily_freq
+    analysis["gemini_data"] = gemini_data
+
+    # If deep mode data exists, calculate hook type diversity and recalculate composite
+    if gemini_data:
+        hook_spend = {}
+        for item in gemini_data:
+            ht = item.get("hook_type", "Unknown")
+            hook_spend[ht] = hook_spend.get(ht, 0) + item.get("spend", 0)
+        total_hook_spend = sum(hook_spend.values()) or 1
+        hook_hhi = sum((s / total_hook_spend * 100) ** 2 for s in hook_spend.values())
+        # HHI-based score: same logic as angle/media diversity
+        if hook_hhi < 1500:
+            hook_score = 100
+        elif hook_hhi < 2500:
+            hook_score = max(40, 100 - (hook_hhi - 1500) / 10)
+        elif hook_hhi < 5000:
+            hook_score = max(10, 40 - (hook_hhi - 2500) / 100)
+        else:
+            hook_score = 10
+        analysis["hook_hhi"] = round(hook_hhi)
+        analysis["sub_scores"]["hook_diversity"] = round(hook_score, 1)
+        # Redistribute weights: funnel 15→12, angle 15→13, hook 10 new
+        ss = analysis["sub_scores"]
+        analysis["composite"] = round(
+            ss["funnel_balance"] * 0.12 +
+            ss["angle_diversity"] * 0.13 +
+            ss["media_diversity"] * 0.10 +
+            ss["hit_rate"] * 0.25 +
+            ss["spend_on_winners"] * 0.25 +
+            ss["volume"] * 0.05 +
+            ss["hook_diversity"] * 0.10
+        )
+
+    # Override avg_frequency with the correct account-level period value
+    if account_freq and account_freq.get("frequency", 0) > 0:
+        analysis["avg_frequency"] = account_freq["frequency"]
+        analysis["account_reach"] = account_freq.get("reach", 0)
+
+    # Pass branding + date range to report
+    # Embed cover image as base64 if it's a local file
+    import base64 as b64mod
+    cover_src = args.cover_image
+    if cover_src and os.path.exists(cover_src):
+        ext = os.path.splitext(cover_src)[1].lower()
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(ext.lstrip("."), "image/jpeg")
+        with open(cover_src, "rb") as img_f:
+            cover_src = f"data:{mime};base64,{b64mod.b64encode(img_f.read()).decode()}"
+    analysis["cover_image"] = cover_src
+    analysis["brand_icon"] = args.icon
+    analysis["date_start"] = pull_meta.get("start_date", "")
+    analysis["date_end"] = pull_meta.get("end_date", "")
 
     print("Generating HTML report...")
     html = generate_html(analysis, args.client, args.account, args.days)

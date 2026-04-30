@@ -25,10 +25,13 @@ import requests
 # CONFIGURATION
 # ============================================================================
 
-META_ACCESS_TOKEN = os.environ.get(
-    "META_ACCESS_TOKEN",
-    "EAAUeobHyYdsBQZCVPLlEq42kOIGHojQbz8Ag2a007TJb7vQe8TRBfWuZAFcOZBFxd3k0Eqoh6wZBrRW85ZAUsZBxV5gz2cfYQb9wYk3SViWtjk13SGPa9ZAvh1gZB2ZAnjlKg9lq3doCNTHwdFZCDSBMExNAc3LguYBPqH1tIhsYVGoJFruNkJ8NttOGw2iECIHgZDZD%"
-)
+def _load_key(name):
+    kf = os.path.join(os.path.expanduser("~"), ".claude", "api_keys.json")
+    if os.path.exists(kf):
+        with open(kf) as f:
+            return json.load(f).get(name, "")
+    return ""
+META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", _load_key("meta_access_token"))
 META_API_VERSION = os.environ.get("META_API_VERSION", "v21.0")
 META_BASE_URL = f"https://graph.facebook.com/{META_API_VERSION}"
 

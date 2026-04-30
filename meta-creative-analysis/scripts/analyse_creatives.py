@@ -46,10 +46,16 @@ except ImportError:
     print("ERROR: 'requests' package required. Install with: pip install requests --break-system-packages")
     sys.exit(1)
 
+def _load_key(name):
+    kf = os.path.join(os.path.expanduser("~"), ".claude", "api_keys.json")
+    if os.path.exists(kf):
+        with open(kf) as f:
+            return json.load(f).get(name, "")
+    return ""
 # ── Configuration ──────────────────────────────────────────────────────────
-META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", "EAAUeobHyYdsBQZCVPLlEq42kOIGHojQbz8Ag2a007TJb7vQe8TRBfWuZAFcOZBFxd3k0Eqoh6wZBrRW85ZAUsZBxV5gz2cfYQb9wYk3SViWtjk13SGPa9ZAvh1gZB2ZAnjlKg9lq3doCNTHwdFZCDSBMExNAc3LguYBPqH1tIhsYVGoJFruNkJ8NttOGw2iECIHgZDZD%")
+META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", _load_key("meta_access_token"))
 AD_ACCOUNT_ID = os.environ.get("AD_ACCOUNT_ID", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDiHNAaM975xxa9N_TGhmZzgR4TPpKCfH0")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", _load_key("gemini_api_key"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 META_API_VERSION = os.environ.get("META_API_VERSION", "v21.0")
 META_BASE_URL = f"https://graph.facebook.com/{META_API_VERSION}"

@@ -47,9 +47,15 @@ except ImportError:
     sys.exit(1)
 
 # ── Configuration ──────────────────────────────────────────────────────────
-META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", "EAAUeobHyYdsBQZCVPLlEq42kOIGHojQbz8Ag2a007TJb7vQe8TRBfWuZAFcOZBFxd3k0Eqoh6wZBrRW85ZAUsZBxV5gz2cfYQb9wYk3SViWtjk13SGPa9ZAvh1gZB2ZAnjlKg9lq3doCNTHwdFZCDSBMExNAc3LguYBPqH1tIhsYVGoJFruNkJ8NttOGw2iECIHgZDZD%")
+def _load_key(name):
+    kf = os.path.join(os.path.expanduser("~"), ".claude", "api_keys.json")
+    if os.path.exists(kf):
+        with open(kf) as f:
+            return json.load(f).get(name, "")
+    return ""
+META_ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN", _load_key("meta_access_token"))
 AD_ACCOUNT_ID = os.environ.get("AD_ACCOUNT_ID", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDiHNAaM975xxa9N_TGhmZzgR4TPpKCfH0")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", _load_key("gemini_api_key"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 META_API_VERSION = os.environ.get("META_API_VERSION", "v21.0")
 META_BASE_URL = f"https://graph.facebook.com/{META_API_VERSION}"
@@ -208,9 +214,12 @@ Check benefit claims against documented benefits. Assess alignment with Strategi
 
 # ── Step 1: Pull top ads by spend ──────────────────────────────────────────
 
-def fetch_top_ads(limit=10, date_preset="last_7d"):
+def fetch_top_ads(limit=10, date_preset="last_7d", since=None, until=None):
     """Fetch top ads sorted by spend descending."""
-    log(f"Fetching top {limit} ads by spend (date_preset={date_preset})...")
+    if since and until:
+        log(f"Fetching top {limit} ads by spend (time_range={since} to {until})...")
+    else:
+        log(f"Fetching top {limit} ads by spend (date_preset={date_preset})...")
 
     # Use the insights endpoint directly — it's more reliable than the complex
     # nested fields query on the /ads endpoint which can hit syntax errors.
@@ -218,11 +227,14 @@ def fetch_top_ads(limit=10, date_preset="last_7d"):
     params = {
         "access_token": META_ACCESS_TOKEN,
         "fields": "ad_id,ad_name,spend,impressions,reach,frequency,clicks,cpc,cpm,ctr,actions,cost_per_action_type,video_thruplay_watched_actions,video_p25_watched_actions,video_p50_watched_actions,video_p75_watched_actions,video_p100_watched_actions,video_avg_time_watched_actions",
-        "date_preset": date_preset,
         "level": "ad",
         "sort": "spend_descending",
         "limit": min(limit, 100),  # API max per page
     }
+    if since and until:
+        params["time_range"] = json.dumps({"since": since, "until": until})
+    else:
+        params["date_preset"] = date_preset
 
     all_insights = []
     next_url = None
@@ -1564,25 +1576,41 @@ def call_gemini(prompt, gemini_file_info=None, max_tokens=4096):
         }
     }
 
-    try:
-        resp = requests.post(url, json=body, timeout=300)
-        if resp.status_code != 200:
+    max_attempts = 5
+    backoff = 4  # seconds, doubles each retry
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(url, json=body, timeout=300)
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "")
+                log(f"    No text in Gemini response", "WARN")
+                return None
+
+            # Retryable errors: 429 (quota/rate), 500/502/503/504 (transient)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                wait = backoff * (2 ** (attempt - 1))
+                log(f"    Gemini {resp.status_code} (attempt {attempt}/{max_attempts}), retrying in {wait}s...", "WARN")
+                time.sleep(wait)
+                continue
+
             log(f"    Gemini error {resp.status_code}: {resp.text[:300]}", "ERROR")
             return None
 
-        data = resp.json()
-        candidates = data.get("candidates", [])
-        if candidates:
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if parts:
-                return parts[0].get("text", "")
+        except Exception as e:
+            if attempt < max_attempts:
+                wait = backoff * (2 ** (attempt - 1))
+                log(f"    Gemini exception (attempt {attempt}/{max_attempts}): {e} — retrying in {wait}s", "WARN")
+                time.sleep(wait)
+                continue
+            log(f"    Gemini error: {e}", "ERROR")
+            return None
 
-        log(f"    No text in Gemini response", "WARN")
-        return None
-
-    except Exception as e:
-        log(f"    Gemini error: {e}", "ERROR")
-        return None
+    return None
 
 
 # ── Step 6: Compute batch averages ──────────────────────────────────────────
@@ -1885,6 +1913,8 @@ def main():
     parser = argparse.ArgumentParser(description="Meta Creative Analysis Pipeline")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--date-preset", default="last_7d")
+    parser.add_argument("--since", default=None, help="Custom start date YYYY-MM-DD (overrides --date-preset)")
+    parser.add_argument("--until", default=None, help="Custom end date YYYY-MM-DD (overrides --date-preset)")
     parser.add_argument("--analysis-type", default="audit", choices=["audit", "persona", "valence", "correlation", "growth-strategy", "custom"])
     parser.add_argument("--metrics-enriched", action="store_true", default=False)
     parser.add_argument("--product-filter", default="")
@@ -1971,7 +2001,7 @@ def main():
     log("━" * 40)
     log("STEP 1/6: Fetching top ads by spend")
     log("━" * 40)
-    ads = fetch_top_ads(limit=args.limit, date_preset=args.date_preset)
+    ads = fetch_top_ads(limit=args.limit, date_preset=args.date_preset, since=args.since, until=args.until)
 
     if not ads:
         log("No ads found! Exiting.", "ERROR")

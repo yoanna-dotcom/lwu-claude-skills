@@ -1,0 +1,56 @@
+{
+  "butter-crust": {
+    "name": "Butter & Crust",
+    "account": "act_249000693",
+    "metric": "cpa",
+    "target": 35,
+    "icon": "\ud83e\udd50",
+    "cover": "covers/butter-crust.jpg",
+    "output_dir": "~/Desktop/butter-and-crust/creative-health"
+  },
+  "carbeth-plants": {
+    "name": "Carbeth Plants",
+    "account": "act_1224808173168010",
+    "metric": "roas",
+    "target": 2,
+    "icon": "\ud83e\udeb4",
+    "cover": "covers/carbeth-plants.jpg",
+    "output_dir": "~/Desktop/carbeth-plants/creative-health"
+  },
+  "a-game": {
+    "name": "A-Game",
+    "account": "act_1003852690909650",
+    "metric": "cpa",
+    "target": 0,
+    "icon": "\ud83c\udfc3",
+    "cover": "covers/a-game.jpg",
+    "output_dir": "~/Desktop/a-game/creative-health"
+  },
+  "flow-hair": {
+    "name": "Flow Hair",
+    "account": "act_1148344280359338",
+    "metric": "roas",
+    "target": 1,
+    "icon": "\ud83c\udf80",
+    "cover": "covers/flow-hair.jpg",
+    "output_dir": "~/Desktop/flow-hair/creative-health"
+  },
+  "heist-of-london": {
+    "name": "Heist Of London",
+    "account": "act_726816749610460",
+    "metric": "roas",
+    "target": 2,
+    "icon": "\ud83d\udc87",
+    "cover": "covers/heist-of-london.jpg",
+    "output_dir": "~/Desktop/heist-of-london/creative-health"
+  },
+  "layered-lounge": {
+    "name": "Layered Lounge",
+    "account": "act_10152840864609120",
+    "metric": "roas",
+    "target": 5.53,
+    "icon": "\ud83c\udfe1",
+    "cover": "covers/carbeth-plants.jpg",
+    "output_dir": "~/Desktop/layer-lounge/creative-health"
+  }
+}

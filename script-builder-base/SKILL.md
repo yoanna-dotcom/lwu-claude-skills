@@ -84,6 +84,7 @@ Before writing a single word, read all of the following:
 - `[client-folder]/feedback/script-feedback-log.md` — already read in Step 0
 - Weekly analysis — Glob `[client-folder]/research/` for latest `weekly-analysis-*.md`. Read it. This is your performance brief.
 - Competitor research — Glob `[client-folder]/research/` for latest `competitor-research-*.md`. If absent, use whitespace section from STRATEGIC-BRIEF.md.
+- Account audit — Glob `[client-folder]/` for `ACCOUNT-AUDIT.md`. If found, read it — use the Repeatable Creative Formula, confirmed angle rankings, and fatigue signals to inform the performance bucket. If absent, log: "ACCOUNT-AUDIT.md not found — performance bucket will draw from weekly analysis only."
 
 **Hard stops:**
 
